@@ -1,7 +1,8 @@
 import { RawData, WebSocket } from "ws";
 import functions from "./functionHandlers";
 
-interface Session {
+export interface Session {
+  id: string;
   twilioConn?: WebSocket;
   frontendConn?: WebSocket;
   modelConn?: WebSocket;
@@ -13,41 +14,48 @@ interface Session {
   openAIApiKey?: string;
 }
 
-let session: Session = {};
+const sessions: Map<string, Session> = new Map();
+
+function generateSessionId(): string {
+  return Math.random().toString(36).substring(2, 10) + Date.now();
+}
 
 export function handleCallConnection(ws: WebSocket, openAIApiKey: string) {
-  cleanupConnection(session.twilioConn);
-  session.twilioConn = ws;
-  session.openAIApiKey = openAIApiKey;
+  const sessionId = generateSessionId();
+  (ws as any).sessionId = sessionId;
+  const session: Session = { id: sessionId, openAIApiKey, twilioConn: ws };
+  sessions.set(sessionId, session);
 
-  ws.on("message", handleTwilioMessage);
+  ws.on("message", (data) => handleTwilioMessage(session, data));
   ws.on("error", ws.close);
   ws.on("close", () => {
-    cleanupConnection(session.modelConn);
     cleanupConnection(session.twilioConn);
+    cleanupConnection(session.modelConn);
     session.twilioConn = undefined;
     session.modelConn = undefined;
     session.streamSid = undefined;
     session.lastAssistantItem = undefined;
     session.responseStartTimestamp = undefined;
     session.latestMediaTimestamp = undefined;
-    if (!session.frontendConn) session = {};
+    if (!session.frontendConn) sessions.delete(sessionId);
   });
 }
 
-export function handleFrontendConnection(ws: WebSocket) {
-  cleanupConnection(session.frontendConn);
+export function handleFrontendConnection(ws: WebSocket, sessionId: string) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  (ws as any).sessionId = sessionId;
   session.frontendConn = ws;
 
-  ws.on("message", handleFrontendMessage);
+  ws.on("message", (data) => handleFrontendMessage(session, data));
   ws.on("close", () => {
     cleanupConnection(session.frontendConn);
     session.frontendConn = undefined;
-    if (!session.twilioConn && !session.modelConn) session = {};
+    if (!session.twilioConn && !session.modelConn) sessions.delete(sessionId);
   });
 }
 
-async function handleFunctionCall(item: { name: string; arguments: string }) {
+async function handleFunctionCall(session: Session, item: { name: string; arguments: string }) {
   console.log("Handling function call:", item);
   const fnDef = functions.find((f) => f.schema.name === item.name);
   if (!fnDef) {
@@ -75,7 +83,7 @@ async function handleFunctionCall(item: { name: string; arguments: string }) {
   }
 }
 
-function handleTwilioMessage(data: RawData) {
+function handleTwilioMessage(session: Session, data: RawData) {
   const msg = parseMessage(data);
   if (!msg) return;
 
@@ -85,7 +93,7 @@ function handleTwilioMessage(data: RawData) {
       session.latestMediaTimestamp = 0;
       session.lastAssistantItem = undefined;
       session.responseStartTimestamp = undefined;
-      tryConnectModel();
+      tryConnectModel(session);
       break;
     case "media":
       session.latestMediaTimestamp = msg.media.timestamp;
@@ -97,12 +105,12 @@ function handleTwilioMessage(data: RawData) {
       }
       break;
     case "close":
-      closeAllConnections();
+      closeAllConnections(session);
       break;
   }
 }
 
-function handleFrontendMessage(data: RawData) {
+function handleFrontendMessage(session: Session, data: RawData) {
   const msg = parseMessage(data);
   if (!msg) return;
 
@@ -115,7 +123,7 @@ function handleFrontendMessage(data: RawData) {
   }
 }
 
-function tryConnectModel() {
+function tryConnectModel(session: Session) {
   if (!session.twilioConn || !session.streamSid || !session.openAIApiKey)
     return;
   if (isOpen(session.modelConn)) return;
@@ -146,12 +154,12 @@ function tryConnectModel() {
     });
   });
 
-  session.modelConn.on("message", handleModelMessage);
-  session.modelConn.on("error", closeModel);
-  session.modelConn.on("close", closeModel);
+  session.modelConn.on("message", (data) => handleModelMessage(session, data));
+  session.modelConn.on("error", () => closeModel(session));
+  session.modelConn.on("close", () => closeModel(session));
 }
 
-function handleModelMessage(data: RawData) {
+function handleModelMessage(session: Session, data: RawData) {
   const event = parseMessage(data);
   if (!event) return;
 
@@ -159,7 +167,7 @@ function handleModelMessage(data: RawData) {
 
   switch (event.type) {
     case "input_audio_buffer.speech_started":
-      handleTruncation();
+      handleTruncation(session);
       break;
 
     case "response.audio.delta":
@@ -185,7 +193,7 @@ function handleModelMessage(data: RawData) {
     case "response.output_item.done": {
       const { item } = event;
       if (item.type === "function_call") {
-        handleFunctionCall(item)
+        handleFunctionCall(session, item)
           .then((output) => {
             if (session.modelConn) {
               jsonSend(session.modelConn, {
@@ -208,7 +216,7 @@ function handleModelMessage(data: RawData) {
   }
 }
 
-function handleTruncation() {
+function handleTruncation(session: Session) {
   if (
     !session.lastAssistantItem ||
     session.responseStartTimestamp === undefined
@@ -239,13 +247,13 @@ function handleTruncation() {
   session.responseStartTimestamp = undefined;
 }
 
-function closeModel() {
+function closeModel(session: Session) {
   cleanupConnection(session.modelConn);
   session.modelConn = undefined;
-  if (!session.twilioConn && !session.frontendConn) session = {};
+  if (!session.twilioConn && !session.frontendConn) sessions.delete(session.id);
 }
 
-function closeAllConnections() {
+function closeAllConnections(session: Session) {
   if (session.twilioConn) {
     session.twilioConn.close();
     session.twilioConn = undefined;
